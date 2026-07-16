@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from typing import Any, Final
 
+import botocore.session
 from botocore.exceptions import ClientError
 
 from moto.batch.utils import JobStatus
@@ -63,11 +64,56 @@ _SUPPORTED_API_PARAM_BINDINGS: Final[dict[str, set[str]]] = {
 
 
 class StateTaskServiceBatch(StateTaskServiceCallback):
+    _BOTO_SERVICE_MODEL: Final = botocore.session.get_session().get_service_model(
+        "batch"
+    )
+
     def __init__(self):
         super().__init__(supported_integration_patterns=_SUPPORTED_INTEGRATION_PATTERNS)
 
     def _get_supported_parameters(self) -> set[str] | None:
         return _SUPPORTED_API_PARAM_BINDINGS.get(self.resource.api_action.lower())
+
+    @staticmethod
+    def _operation_name_from_api_action(api_action: str) -> str:
+        # Converts either the resource's lowerCamelCase api_action (e.g.
+        # "submitJob") or a snake_case override (e.g. "describe_jobs", as
+        # passed by callers of _normalise_response) into the PascalCase
+        # operation name botocore's service model is keyed by (e.g.
+        # "SubmitJob" / "DescribeJobs").
+        if "_" in api_action:
+            return "".join(part.capitalize() for part in api_action.split("_"))
+        return api_action[0].upper() + api_action[1:]
+
+    def _normalise_parameters(
+        self,
+        parameters: dict,
+        boto_service_name: str | None = None,
+        service_action_name: str | None = None,
+    ) -> None:
+        # Batch is a rest-json protocol service: botocore's generated client
+        # methods expect lowerCamelCase kwargs (e.g. jobName/jobQueue), not
+        # the PascalCase field names ASL Parameters use (JobName/JobQueue).
+        # Without this conversion boto3 either rejects the call outright or
+        # (with parameter validation disabled, as moto's boto_client_for
+        # does) fails deeper inside botocore's request serializer.
+        operation_name = self._operation_name_from_api_action(
+            service_action_name or self.resource.api_action
+        )
+        operation_model = self._BOTO_SERVICE_MODEL.operation_model(operation_name)
+        self._to_boto_request(parameters, operation_model.input_shape)
+
+    def _normalise_response(
+        self,
+        response: Any,
+        boto_service_name: str | None = None,
+        service_action_name: str | None = None,
+    ) -> None:
+        operation_name = self._operation_name_from_api_action(
+            service_action_name or self.resource.api_action
+        )
+        operation_model = self._BOTO_SERVICE_MODEL.operation_model(operation_name)
+        self._from_boto_response(response, operation_model.output_shape)
 
     @staticmethod
     def _attach_aws_environment_variables(parameters: dict) -> None:
@@ -150,6 +196,8 @@ class StateTaskServiceBatch(StateTaskServiceCallback):
             state_credentials=state_credentials,
         )
         submission_output: dict = env.stack.pop()
+        # _eval_execution normalises the submit_job response to PascalCase
+        # (via _normalise_response) before this callback machinery runs.
         job_id = submission_output["JobId"]
 
         def _sync_resolver() -> dict | None:
