@@ -1,7 +1,8 @@
 import logging
-from typing import Final
+from typing import Any, Final
 
 from botocore.exceptions import ClientError
+from botocore.response import StreamingBody
 
 from moto.stepfunctions.parser.api import HistoryEventType, TaskFailedEventDetails
 from moto.stepfunctions.parser.asl.component.common.error_name.error_name import (
@@ -23,6 +24,7 @@ from moto.stepfunctions.parser.asl.component.state.exec.state_task.service.state
 from moto.stepfunctions.parser.asl.eval.environment import Environment
 from moto.stepfunctions.parser.asl.eval.event.event_detail import EventDetails
 from moto.stepfunctions.parser.asl.utils.boto_client import boto_client_for
+from moto.stepfunctions.parser.utils import to_str
 
 LOG = logging.getLogger(__name__)
 
@@ -35,6 +37,17 @@ _SERVICE_ERROR_NAMES = {"dynamodb": "DynamoDb", "sfn": "Sfn"}
 
 
 class StateTaskServiceAwsSdk(StateTaskServiceCallback):
+    # ASL's aws-sdk integration ARNs use each service's API "endpoint prefix"
+    # (e.g. "bedrockruntime", matching AWS's own aws-sdk resource examples),
+    # which for a growing number of services no longer matches botocore's
+    # client factory service name (boto3.client(service_name=...) requires
+    # "bedrock-runtime"). The base StateTaskService._get_boto_service_name
+    # already consults this per-class override table for exactly this kind
+    # of mismatch (see "sfn"/"states" -> "stepfunctions" above it).
+    _SERVICE_NAME_SFN_TO_BOTO_OVERRIDES: Final[dict[str, str]] = {
+        "bedrockruntime": "bedrock-runtime",
+    }
+
     def __init__(self):
         super().__init__(supported_integration_patterns=_SUPPORTED_INTEGRATION_PATTERNS)
 
@@ -129,3 +142,32 @@ class StateTaskServiceAwsSdk(StateTaskServiceCallback):
         if response:
             response.pop("ResponseMetadata", None)
         env.stack.append(response)
+
+    @staticmethod
+    def _normalise_response_value(value: Any) -> Any:
+        # As no aws-sdk support catalog is available (see
+        # _validate_service_integration_is_supported), there's no shape
+        # info to drive a targeted conversion the way StateTaskServiceBatch
+        # does for its own known operations. Blob-shaped response members
+        # (e.g. bedrock-runtime's InvokeModel "body") come back from boto3
+        # as a botocore StreamingBody, which _after_eval_execution can't
+        # JSON-serialise for the TaskSucceeded history event or state
+        # output - so walk the response structurally and decode any stream
+        # we find, no shape catalog required.
+        if isinstance(value, StreamingBody):
+            return to_str(value.read())
+        if isinstance(value, dict):
+            return {k: StateTaskServiceAwsSdk._normalise_response_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [StateTaskServiceAwsSdk._normalise_response_value(v) for v in value]
+        return value
+
+    def _normalise_response(
+        self,
+        response: Any,
+        boto_service_name: str | None = None,
+        service_action_name: str | None = None,
+    ) -> None:
+        if isinstance(response, dict):
+            for key in list(response.keys()):
+                response[key] = self._normalise_response_value(response[key])
