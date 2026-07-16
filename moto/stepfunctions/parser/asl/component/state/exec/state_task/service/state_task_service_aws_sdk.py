@@ -1,3 +1,4 @@
+import datetime
 import logging
 from typing import Any, Final
 
@@ -154,8 +155,20 @@ class StateTaskServiceAwsSdk(StateTaskServiceCallback):
         # JSON-serialise for the TaskSucceeded history event or state
         # output - so walk the response structurally and decode any stream
         # we find, no shape catalog required.
+        #
+        # Timestamp-shaped members (e.g. S3's GetObject "LastModified") come
+        # back as datetime objects for the same reason. _after_eval_execution
+        # stringifies its own copy of the output via to_json_str (which does
+        # handle datetimes, see encoding._DateTimeEncoder), but the raw
+        # execution output moto persists for DescribeExecution is JSON-dumped
+        # elsewhere (stepfunctions/responses.py) without that encoder -
+        # converting to ISO 8601 here (matching real AWS's documented
+        # behaviour for SDK integration responses) avoids leaking a raw
+        # datetime into that path at all.
         if isinstance(value, StreamingBody):
             return to_str(value.read())
+        if isinstance(value, (datetime.date, datetime.datetime)):
+            return value.isoformat()
         if isinstance(value, dict):
             return {k: StateTaskServiceAwsSdk._normalise_response_value(v) for k, v in value.items()}
         if isinstance(value, list):
