@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections.abc import Iterator
@@ -35,6 +36,15 @@ from .utils import PAGINATION_MODEL, api_to_cfn_tags, cfn_to_api_tags
 
 
 class StateMachineInstance:
+    # Attributes deliberately excluded from copy.deepcopy(...) - see
+    # __deepcopy__ below. "executions" can hold Execution objects that are
+    # genuinely paused mid .waitForTaskToken (a real threading.Event/Lock in
+    # their exec_worker.env.callback_pool_manager), which copy.deepcopy
+    # can't pickle-walk; deep-copying it is also pointless, since cloning a
+    # StateMachineInstance is only ever done to snapshot its own definition
+    # for a *new* Execution, which never reads other executions' state.
+    _deepcopy_shallow_attrs: tuple[str, ...] = ("executions",)
+
     def __init__(
         self,
         arn: str,
@@ -60,6 +70,17 @@ class StateMachineInstance:
         self.tracingConfiguration = tracingConfiguration or {"enabled": False}
         self.sm_type = "STANDARD"  # or express
         self.description: str | None = None
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> StateMachineInstance:
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for key, value in self.__dict__.items():
+            if key in self._deepcopy_shallow_attrs:
+                setattr(result, key, value)
+            else:
+                setattr(result, key, copy.deepcopy(value, memo))
+        return result
 
 
 class StateMachineAlias(CloudFormationModel):
@@ -106,6 +127,15 @@ class StateMachineVersion(StateMachineInstance, CloudFormationModel):
 
 
 class StateMachine(StateMachineInstance, CloudFormationModel):
+    # backend is a back-reference to the shared, process-wide backend (which
+    # itself transitively references every other state machine's
+    # executions) - deep-copying it would both recurse into the same live
+    # Lock objects __deepcopy__ above works around, and produce a bogus
+    # duplicate backend no code is meant to observe.
+    _deepcopy_shallow_attrs = StateMachineInstance._deepcopy_shallow_attrs + (
+        "backend",
+    )
+
     def __init__(
         self,
         arn: str,
