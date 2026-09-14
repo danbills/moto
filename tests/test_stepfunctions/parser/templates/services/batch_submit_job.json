@@ -1,0 +1,16 @@
+{
+  "Comment": "BATCH_SUBMIT_JOB_SYNC",
+  "StartAt": "SubmitJob",
+  "States": {
+    "SubmitJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::batch:submitJob.sync",
+      "Parameters": {
+        "JobName.$": "$.JobName",
+        "JobQueue.$": "$.JobQueue",
+        "JobDefinition.$": "$.JobDefinition"
+      },
+      "End": true
+    }
+  }
+}
